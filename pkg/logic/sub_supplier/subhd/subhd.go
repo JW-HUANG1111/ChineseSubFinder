@@ -1,10 +1,14 @@
 package subhd
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
-	"strconv"
+	"regexp"
 	"strings"
 	"time"
 
@@ -18,14 +22,19 @@ import (
 	"github.com/ChineseSubFinder/ChineseSubFinder/pkg/logic/file_downloader"
 	"github.com/ChineseSubFinder/ChineseSubFinder/pkg/mix_media_info"
 	"github.com/ChineseSubFinder/ChineseSubFinder/pkg/settings"
-	"github.com/PuerkitoBio/goquery"
 	"github.com/sirupsen/logrus"
 )
+
+// FlareSolverrConfig holds the FlareSolverr connection settings.
+// Default address: http://192.168.0.250:8191
+// Can be overridden via FLARESOLVERR_URL env var or settings.
+var FlareSolverrURL = "http://192.168.0.250:8191"
 
 type Supplier struct {
 	log            *logrus.Logger
 	fileDownloader *file_downloader.FileDownloader
 	isAlive        bool
+	httpClient     *http.Client
 }
 
 func NewSupplier(fileDownloader *file_downloader.FileDownloader) *Supplier {
@@ -33,24 +42,29 @@ func NewSupplier(fileDownloader *file_downloader.FileDownloader) *Supplier {
 	sup.log = fileDownloader.Log
 	sup.fileDownloader = fileDownloader
 	sup.isAlive = true
+	sup.httpClient = &http.Client{Timeout: 30 * time.Second}
+
+	// Allow override via env or settings
+	if envURL := pkg.GetEnv("FLARESOLVERR_URL", ""); envURL != "" {
+		FlareSolverrURL = envURL
+	}
+
 	return &sup
 }
 
 func (s *Supplier) CheckAlive() (bool, int64) {
 	startT := time.Now()
-	httpClient, err := pkg.NewHttpClient()
+
+	// Test FlareSolverr with a simple request
+	resp, err := s.flareSolverrRequest("GET", settings.Get().AdvancedSettings.SuppliersSettings.SubHD.RootUrl, nil, nil, 0)
 	if err != nil {
-		s.log.Errorln(s.GetSupplierName(), "CheckAlive.NewHttpClient", err)
+		s.log.Errorln(s.GetSupplierName(), "CheckAlive.FlareSolverr", err)
 		return false, 0
 	}
-	searchPageUrl := settings.Get().AdvancedSettings.SuppliersSettings.SubHD.GetSearchUrl()
-	resp, err := httpClient.R().Get(searchPageUrl)
-	if err != nil {
-		s.log.Errorln(s.GetSupplierName(), "CheckAlive.Get", err)
-		return false, 0
-	}
-	if resp.StatusCode() != 200 {
-		s.log.Errorln(s.GetSupplierName(), "CheckAlive.StatusCode", resp.StatusCode())
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		s.log.Errorln(s.GetSupplierName(), "CheckAlive.StatusCode", resp.StatusCode)
 		return false, 0
 	}
 	s.isAlive = true
@@ -101,8 +115,7 @@ func (s *Supplier) GetSubListFromFile4Movie(videoFPath string) ([]supplier.SubIn
 
 	airTime, err := time.Parse("2006", mediaInfo.Year)
 	if err != nil || mediaInfo.Year == "" {
-		// 年份为空或解析失败，直接用关键词搜索
-		searchKeyword = keyWord
+		searchKeyword := keyWord
 	} else {
 		searchKeyword = fmt.Sprintf("%s %d", keyWord, airTime.Year())
 	}
@@ -154,12 +167,12 @@ func (s *Supplier) GetSubListFromFile4Series(seriesInfo *series.SeriesInfo) ([]s
 			return nil, err
 		}
 
-			// 优先搜索 SxxExx 格式
-			searchKeyword := fmt.Sprintf("%s S%02dE%02d %s", keyWord, episodeInfo.Season, episodeInfo.Episode, mediaInfo.Year)
-			searchResultItems, err := s.searchKeyword(searchKeyword, false)
-			if err != nil || len(searchResultItems) == 0 {
-				// 没有则搜索全季
-				searchKeyword = fmt.Sprintf("%s S%02d", keyWord, episodeInfo.Season)
+		// Prioritize SxxExx format
+		searchKeyword := fmt.Sprintf("%s S%02dE%02d", keyWord, episodeInfo.Season, episodeInfo.Episode)
+		searchResultItems, err := s.searchKeyword(searchKeyword, false)
+		if err != nil || len(searchResultItems) == 0 {
+			// Fall back to full season search
+			searchKeyword = fmt.Sprintf("%s S%02d", keyWord, episodeInfo.Season)
 			searchResultItems, err = s.searchKeyword(searchKeyword, false)
 			if err != nil || len(searchResultItems) == 0 {
 				s.log.Infoln(s.GetSupplierName(), episodeInfo.Season, episodeInfo.Episode, "no sub found")
@@ -196,127 +209,227 @@ func (s *Supplier) GetSubListFromFile4Anime(seriesInfo *series.SeriesInfo) ([]su
 	return s.GetSubListFromFile4Series(seriesInfo)
 }
 
-// searchKeyword 搜索字幕
+// searchKeyword uses FlareSolverr to search for subtitles
 func (s *Supplier) searchKeyword(keyword string, isMovie bool) ([]SearchResultItem, error) {
-	httpClient, err := pkg.NewHttpClient()
-	if err != nil {
-		return nil, errors.New("NewHttpClient error:" + err.Error())
-	}
-
 	searchUrl := settings.Get().AdvancedSettings.SuppliersSettings.SubHD.GetSearchUrl()
 	encoded := url.QueryEscape(keyword)
-	pageUrl := fmt.Sprintf(searchUrl, encoded)
+	pageUrl := fmt.Sprintf("%s%s", searchUrl, encoded)
 
-	resp, err := httpClient.R().Get(pageUrl)
+	resp, err := s.flareSolverrRequest("GET", pageUrl, nil, nil, 30000)
 	if err != nil {
-		return nil, errors.New("http get error:" + err.Error())
+		return nil, errors.New("FlareSolverr request error:" + err.Error())
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("FlareSolverr status %d", resp.StatusCode)
 	}
 
-	return s.parseSearchResult(resp.String(), isMovie)
+	return s.parseSearchResult(resp.Body, isMovie)
 }
 
-// parseSearchResult 解析搜索结果页面
-func (s *Supplier) parseSearchResult(html string, isMovie bool) ([]SearchResultItem, error) {
+// parseSearchResult parses SubHD search HTML via FlareSolverr
+func (s *Supplier) parseSearchResult(body io.Reader, isMovie bool) ([]SearchResultItem, error) {
+	// Read all content
+	content, err := io.ReadAll(body)
+	if err != nil {
+		return nil, err
+	}
+	html := string(content)
+
 	searchResultItems := make([]SearchResultItem, 0)
 
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
-	if err != nil {
-		return nil, errors.New("goquery NewDocumentFromReader error:" + err.Error())
-	}
+	// SubHD search results use: <a class="link-dark align-middle" href="/a/{id}">{title}
+	// Extract all /a/{id} links with their titles
+	re := regexp.MustCompile(`href="/a/([a-zA-Z0-9]+)"[^>]*>([^<]+)<`)
+	matches := re.FindAllStringSubmatch(html, -1)
 
-	// SubHD 搜索结果在 .box 和 .list 类的元素中
-	doc.Find(".box, .list, .sub-list, .sub-item").EachWithBreak(func(i int, selection *goquery.Selection) bool {
-		// 尝试找标题和链接
-		var title string
-		var href string
+	titleRe := regexp.MustCompile(`link-dark align-middle[^>]+href="/a/([a-zA-Z0-9]+)"[^>]*>([^<]+)`)
 
-		selection.Find("a").EachWithBreak(func(j int, a *goquery.Selection) bool {
-			title = a.Text()
-			href, _ = a.Attr("href")
-			return false
-		})
-
-		if title == "" || href == "" {
-			return true
+	for _, match := range matches {
+		id := match[1]
+		title := strings.TrimSpace(match[2])
+		if title == "" {
+			continue
 		}
 
-		isFullSeason, season, eps, err := decode.GetSeasonAndEpisodeFromSubFileName(title)
-		if err != nil {
-			s.log.Warningln(s.GetSupplierName(), "decode.GetSeasonAndEpisodeFromSubFileName", err)
-			return true
-		}
-
-		searchResultItems = append(searchResultItems, SearchResultItem{
+		isFullSeason, season, eps, _ := decode.GetSeasonAndEpisodeFromSubFileName(title)
+		item := SearchResultItem{
 			Title:        title,
 			IsMovie:      isMovie,
-			RUrl:         s.makeAbsoluteUrl(href, settings.Get().AdvancedSettings.SuppliersSettings.SubHD.RootUrl),
+			RUrl:         "/a/" + id, // relative path, makeAbsoluteUrl will handle
 			Season:       season,
 			Episode:      eps,
 			IsFullSeason: isFullSeason,
-		})
-
-		return true
-	})
+		}
+		searchResultItems = append(searchResultItems, item)
+	}
 
 	return searchResultItems, nil
 }
 
-// downloadSub 下载字幕
+// downloadSub downloads a subtitle from SubHD via FlareSolverr
 func (s *Supplier) downloadSub(videoFPath, pageUrl string, season, episode int) (*supplier.SubInfo, error) {
-	httpClient, err := pkg.NewHttpClient()
+	rootUrl := settings.Get().AdvancedSettings.SuppliersSettings.SubHD.RootUrl
+
+	// Make absolute URL if needed
+	if strings.HasPrefix(pageUrl, "/") {
+		pageUrl = rootUrl + pageUrl
+	}
+	detailUrl := pageUrl
+
+	// Get detail page through FlareSolverr to extract sid
+	resp, err := s.flareSolverrRequest("GET", detailUrl, nil, nil, 30000)
 	if err != nil {
-		return nil, errors.New("NewHttpClient error:" + err.Error())
+		return nil, errors.New("FlareSolverr request error:" + err.Error())
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("detail page status %d", resp.StatusCode)
 	}
 
-	resp, err := httpClient.R().Get(pageUrl)
+	content, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, errors.New("http get error:" + err.Error())
+		return nil, err
+	}
+	html := string(content)
+
+	// Extract sid from page (sid="kAlURK" attribute)
+	sidRe := regexp.MustCompile(`sid="([a-zA-Z0-9]+)"`)
+	sidMatch := sidRe.FindStringSubmatch(html)
+	if len(sidMatch) < 2 {
+		return nil, errors.New("sid not found on detail page")
+	}
+	sid := sidMatch[1]
+
+	// Try download via AJAX POST
+	postData := fmt.Sprintf("sub_id=%s", sid)
+	ajaxUrl := rootUrl + "/ajax/down_ajax"
+
+	ajaxResp, err := s.flareSolverrRequest("POST", ajaxUrl, map[string]string{
+		"Content-Type":       "application/x-www-form-urlencoded",
+		"X-Requested-With":   "XMLHttpRequest",
+		"Referer":            detailUrl,
+		"Origin":              rootUrl,
+		"User-Agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+	}, &postData, 30000)
+	if err != nil {
+		return nil, errors.New("FlareSolverr AJAX request error:" + err.Error())
+	}
+	defer ajaxResp.Body.Close()
+
+	ajaxContent, _ := io.ReadAll(ajaxResp.Body)
+	ajaxHtml := string(ajaxContent)
+
+	// Check if we got JSON with success=true and url
+	if strings.Contains(ajaxHtml, `"success":true`) && strings.Contains(ajaxHtml, `"url"`) {
+		urlRe := regexp.MustCompile(`"url"\s*:\s*"([^"]+)"`)
+		urlMatch := urlRe.FindStringSubmatch(ajaxHtml)
+		if len(urlMatch) >= 2 {
+			downloadUrl := urlMatch[1]
+			ext := getExt(downloadUrl)
+			return &supplier.SubInfo{
+				Season:       season,
+				Episode:      episode,
+				VideoFPath:   videoFPath,
+				SupplierName: s.GetSupplierName(),
+				Link:         downloadUrl,
+				Ext:          ext,
+			}, nil
+		}
 	}
 
-	subInfos := s.parseSubPage(resp.String(), videoFPath, season, episode)
-	if len(subInfos) == 0 {
-		return nil, errors.New("no subtitle found on page")
+	// If AJAX failed, return error with the response
+	errMsg := strings.TrimSpace(ajaxHtml)
+	if len(errMsg) > 100 {
+		errMsg = errMsg[:100]
 	}
-
-	// 修正相对路径并返回第一个字幕（评分最高的）
-	first := subInfos[0]
-	first.Link = s.makeAbsoluteUrl(first.Link, settings.Get().AdvancedSettings.SuppliersSettings.SubHD.RootUrl)
-	return &first, nil
+	return nil, errors.New("download failed: " + errMsg)
 }
 
-// parseSubPage 解析字幕详情页，查找字幕下载链接
-func (s *Supplier) parseSubPage(html, videoFPath string, season, episode int) []supplier.SubInfo {
-	subInfos := make([]supplier.SubInfo, 0)
+// flareSolverrRequest makes a request through FlareSolverr
+// method: "GET" or "POST"
+// url: full URL
+// headers: optional headers map
+// postData: for POST requests, pointer to string data (nil for GET)
+// timeoutMs: request timeout in milliseconds
+func (s *Supplier) flareSolverrRequest(method, targetUrl string, headers map[string]string, postData *string, timeoutMs int) (*FlareSolverrResponse, error) {
+	flareURL := FlareSolverrURL + "/v1"
 
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
-	if err != nil {
-		return subInfos
+	reqBody := map[string]interface{}{
+		"cmd":        fmt.Sprintf("request.%s", strings.ToLower(method)),
+		"url":        targetUrl,
+		"maxTimeout": timeoutMs,
+	}
+	if timeoutMs == 0 {
+		reqBody["maxTimeout"] = 30000
 	}
 
-	// 查找下载链接
-	doc.Find("a[href*='.zip'], a[href*='.srt'], a[href*='.ass'], a[href*='.ssa'], .download a, .btn-download a").EachWithBreak(func(i int, selection *goquery.Selection) bool {
-		href, ok := selection.Attr("href")
-		if !ok || href == "" {
-			return true
+	if headers != nil {
+		reqHeaders := make(map[string]string)
+		for k, v := range headers {
+			reqHeaders[k] = v
 		}
+		reqBody["headers"] = reqHeaders
+	}
 
-		subInfo := supplier.SubInfo{
-			Season:       season,
-			Episode:      episode,
-			VideoFPath:   videoFPath,
-			SupplierName: s.GetSupplierName(),
-			Link:         href,
-			Ext:          s.getExt(href),
-		}
+	if method == "POST" && postData != nil {
+		reqBody["postData"] = *postData
+	}
 
-		subInfos = append(subInfos, subInfo)
-		return len(subInfos) < 5
-	})
+	reqJSON, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, err
+	}
 
-	return subInfos
+	req, err := http.NewRequest("POST", flareURL, bytes.NewReader(reqJSON))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
+	resp.Body.Close()
+
+	var flareResp FlareSolverrResponse
+	if err := json.Unmarshal(body, &flareResp); err != nil {
+		return nil, err
+	}
+
+	if flareResp.Status == "error" {
+		return &flareResp, errors.New(flareResp.Message)
+	}
+
+	return &flareResp, nil
 }
 
-// makeAbsoluteUrl 将相对路径转换为绝对 URL
+// FlareSolverrResponse represents FlareSolverr API response
+type FlareSolverrResponse struct {
+	Status         string `json:"status"`
+	Message       string `json:"message,omitempty"`
+	Session       string `json:"session,omitempty"`
+	Solution      struct {
+		Url       string            `json:"url"`
+		Status    int               `json:"status"`
+		Cookies   []interface{}     `json:"cookies"`
+		UserAgent string            `json:"userAgent"`
+		Headers   map[string]string `json:"headers"`
+		Response  string            `json:"response"`
+	} `json:"solution"`
+}
+
+// makeAbsoluteUrl converts relative URL to absolute
 func (s *Supplier) makeAbsoluteUrl(href, rootUrl string) string {
 	if strings.HasPrefix(href, "http") {
 		return href
@@ -327,7 +440,7 @@ func (s *Supplier) makeAbsoluteUrl(href, rootUrl string) string {
 	return rootUrl + "/" + href
 }
 
-func (s *Supplier) getExt(href string) string {
+func getExt(href string) string {
 	lower := strings.ToLower(href)
 	if strings.HasSuffix(lower, ".zip") {
 		return ".zip"
@@ -344,7 +457,7 @@ func (s *Supplier) getExt(href string) string {
 	return ".zip"
 }
 
-// SearchResultItem 搜索结果项
+// SearchResultItem represents a search result entry
 type SearchResultItem struct {
 	Title        string
 	IsMovie      bool
@@ -352,20 +465,4 @@ type SearchResultItem struct {
 	Season       int
 	Episode      int
 	IsFullSeason bool
-}
-
-// getTotalPage 从搜索页获取总页数
-func (s *Supplier) getTotalPage(doc *goquery.Document) int {
-	pages := doc.Find(".pagination a, .page a, .pager a, .pages a")
-	var maxPage int
-	pages.EachWithBreak(func(i int, selection *goquery.Selection) bool {
-		text := selection.Text()
-		if n, err := strconv.Atoi(strings.TrimSpace(text)); err == nil {
-			if n > maxPage {
-				maxPage = n
-			}
-		}
-		return true
-	})
-	return maxPage
 }
