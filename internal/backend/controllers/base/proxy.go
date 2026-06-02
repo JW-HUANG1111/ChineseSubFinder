@@ -12,9 +12,12 @@ import (
 	"github.com/ChineseSubFinder/ChineseSubFinder/pkg/types/backend"
 
 	subSupplier "github.com/ChineseSubFinder/ChineseSubFinder/pkg/logic/sub_supplier"
+	"github.com/ChineseSubFinder/ChineseSubFinder/pkg/logic/sub_supplier/a4k"
 	"github.com/ChineseSubFinder/ChineseSubFinder/pkg/logic/sub_supplier/assrt"
 	"github.com/ChineseSubFinder/ChineseSubFinder/pkg/logic/sub_supplier/shooter"
+	"github.com/ChineseSubFinder/ChineseSubFinder/pkg/logic/sub_supplier/subhd"
 	"github.com/ChineseSubFinder/ChineseSubFinder/pkg/logic/sub_supplier/xunlei"
+	"github.com/ChineseSubFinder/ChineseSubFinder/pkg/logic/sub_supplier/zimuku"
 
 	"github.com/gin-gonic/gin"
 )
@@ -65,8 +68,8 @@ func (cb *ControllerBase) CheckProxyHandler(c *gin.Context) {
 	// 使用提交过来的这个代理地址，测试多个字幕网站的可用性
 	subSupplierHub := subSupplier.NewSubSupplierHub(
 		// 这里无需传递下载字幕的缓存实例
-		//zimuku.NewSupplier(cb.fileDownloader),
-		//subhd.NewSupplier(cb.fileDownloader),
+		zimuku.NewSupplier(cb.fileDownloader),
+		subhd.NewSupplier(cb.fileDownloader),
 		xunlei.NewSupplier(cb.fileDownloader),
 		shooter.NewSupplier(cb.fileDownloader),
 		a4k.NewSupplier(cb.fileDownloader),
