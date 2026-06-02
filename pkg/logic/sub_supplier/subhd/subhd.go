@@ -99,8 +99,13 @@ func (s *Supplier) GetSubListFromFile4Movie(videoFPath string) ([]supplier.SubIn
 		return nil, err
 	}
 
-	airTime, _ := time.Parse("2006", mediaInfo.Year)
-	searchKeyword := fmt.Sprintf("%s %d", keyWord, airTime.Year())
+	airTime, err := time.Parse("2006", mediaInfo.Year)
+	if err != nil || mediaInfo.Year == "" {
+		// 年份为空或解析失败，直接用关键词搜索
+		searchKeyword = keyWord
+	} else {
+		searchKeyword = fmt.Sprintf("%s %d", keyWord, airTime.Year())
+	}
 	s.log.Infoln(s.GetSupplierName(), "searchKeyword", searchKeyword)
 
 	searchResultItems, err := s.searchKeyword(searchKeyword, true)
@@ -149,12 +154,12 @@ func (s *Supplier) GetSubListFromFile4Series(seriesInfo *series.SeriesInfo) ([]s
 			return nil, err
 		}
 
-		// 优先搜索 SxxExx 格式
-		searchKeyword := fmt.Sprintf("%s S%02dE%02d", keyWord, episodeInfo.Season, episodeInfo.Episode)
-		searchResultItems, err := s.searchKeyword(searchKeyword, false)
-		if err != nil || len(searchResultItems) == 0 {
-			// 没有则搜索全季
-			searchKeyword = fmt.Sprintf("%s S%02d", keyWord, episodeInfo.Season)
+			// 优先搜索 SxxExx 格式
+			searchKeyword := fmt.Sprintf("%s S%02dE%02d %s", keyWord, episodeInfo.Season, episodeInfo.Episode, mediaInfo.Year)
+			searchResultItems, err := s.searchKeyword(searchKeyword, false)
+			if err != nil || len(searchResultItems) == 0 {
+				// 没有则搜索全季
+				searchKeyword = fmt.Sprintf("%s S%02d", keyWord, episodeInfo.Season)
 			searchResultItems, err = s.searchKeyword(searchKeyword, false)
 			if err != nil || len(searchResultItems) == 0 {
 				s.log.Infoln(s.GetSupplierName(), episodeInfo.Season, episodeInfo.Episode, "no sub found")
@@ -200,7 +205,7 @@ func (s *Supplier) searchKeyword(keyword string, isMovie bool) ([]SearchResultIt
 
 	searchUrl := settings.Get().AdvancedSettings.SuppliersSettings.SubHD.GetSearchUrl()
 	encoded := url.QueryEscape(keyword)
-	pageUrl := fmt.Sprintf("%s%s%s", searchUrl, "", encoded)
+	pageUrl := fmt.Sprintf(searchUrl, encoded)
 
 	resp, err := httpClient.R().Get(pageUrl)
 	if err != nil {
@@ -244,7 +249,7 @@ func (s *Supplier) parseSearchResult(html string, isMovie bool) ([]SearchResultI
 		searchResultItems = append(searchResultItems, SearchResultItem{
 			Title:        title,
 			IsMovie:      isMovie,
-			RUrl:         href,
+			RUrl:         s.makeAbsoluteUrl(href, settings.Get().AdvancedSettings.SuppliersSettings.SubHD.RootUrl),
 			Season:       season,
 			Episode:      eps,
 			IsFullSeason: isFullSeason,
@@ -273,8 +278,10 @@ func (s *Supplier) downloadSub(videoFPath, pageUrl string, season, episode int) 
 		return nil, errors.New("no subtitle found on page")
 	}
 
-	// 返回第一个字幕（评分最高的）
-	return &subInfos[0], nil
+	// 修正相对路径并返回第一个字幕（评分最高的）
+	first := subInfos[0]
+	first.Link = s.makeAbsoluteUrl(first.Link, settings.Get().AdvancedSettings.SuppliersSettings.SubHD.RootUrl)
+	return &first, nil
 }
 
 // parseSubPage 解析字幕详情页，查找字幕下载链接
@@ -309,6 +316,17 @@ func (s *Supplier) parseSubPage(html, videoFPath string, season, episode int) []
 	return subInfos
 }
 
+// makeAbsoluteUrl 将相对路径转换为绝对 URL
+func (s *Supplier) makeAbsoluteUrl(href, rootUrl string) string {
+	if strings.HasPrefix(href, "http") {
+		return href
+	}
+	if strings.HasPrefix(href, "/") {
+		return rootUrl + href
+	}
+	return rootUrl + "/" + href
+}
+
 func (s *Supplier) getExt(href string) string {
 	lower := strings.ToLower(href)
 	if strings.HasSuffix(lower, ".zip") {
@@ -340,7 +358,7 @@ type SearchResultItem struct {
 func (s *Supplier) getTotalPage(doc *goquery.Document) int {
 	pages := doc.Find(".pagination a, .page a, .pager a, .pages a")
 	var maxPage int
-	pages.Each(func(i int, selection *goquery.Selection) bool {
+	pages.EachWithBreak(func(i int, selection *goquery.Selection) bool {
 		text := selection.Text()
 		if n, err := strconv.Atoi(strings.TrimSpace(text)); err == nil {
 			if n > maxPage {

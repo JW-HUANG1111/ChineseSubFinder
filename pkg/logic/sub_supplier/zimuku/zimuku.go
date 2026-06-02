@@ -99,8 +99,12 @@ func (s *Supplier) GetSubListFromFile4Movie(videoFPath string) ([]supplier.SubIn
 		return nil, err
 	}
 
-	airTime, _ := time.Parse("2006", mediaInfo.Year)
-	searchKeyword := fmt.Sprintf("%s %d", keyWord, airTime.Year())
+	airTime, err := time.Parse("2006", mediaInfo.Year)
+	if err != nil || mediaInfo.Year == "" {
+		searchKeyword = keyWord
+	} else {
+		searchKeyword = fmt.Sprintf("%s %d", keyWord, airTime.Year())
+	}
 	s.log.Infoln(s.GetSupplierName(), "searchKeyword", searchKeyword)
 
 	searchResultItems, err := s.searchKeyword(searchKeyword, true)
@@ -201,7 +205,7 @@ func (s *Supplier) searchKeyword(keyword string, isMovie bool) ([]SearchResultIt
 	rootUrl := settings.Get().AdvancedSettings.SuppliersSettings.Zimuku.RootUrl
 	searchFormat := settings.Get().AdvancedSettings.SuppliersSettings.Zimuku.SearchUrl
 	encoded := url.QueryEscape(keyword)
-	pageUrl := fmt.Sprintf("%s%s%s", rootUrl, searchFormat, encoded)
+	pageUrl := fmt.Sprintf(rootUrl + searchFormat, encoded)
 
 	resp, err := httpClient.R().Get(pageUrl)
 	if err != nil {
@@ -248,7 +252,7 @@ func (s *Supplier) parseSearchResult(html string, isMovie bool) ([]SearchResultI
 		searchResultItems = append(searchResultItems, SearchResultItem{
 			Title:        title,
 			IsMovie:      isMovie,
-			RUrl:         rootUrl + href,
+			RUrl:         s.makeAbsoluteUrl(href, settings.Get().AdvancedSettings.SuppliersSettings.Zimuku.RootUrl),
 			Season:       season,
 			Episode:      eps,
 			IsFullSeason: isFullSeason,
@@ -301,12 +305,13 @@ func (s *Supplier) parseSubPage(html, videoFPath string, season, episode int) []
 			href = rootUrl + href
 		}
 
+		hrefAbs := s.makeAbsoluteUrl(href, settings.Get().AdvancedSettings.SuppliersSettings.Zimuku.RootUrl)
 		subInfo := supplier.SubInfo{
 			Season:       season,
 			Episode:      episode,
 			VideoFPath:   videoFPath,
 			SupplierName: s.GetSupplierName(),
-			Link:         href,
+			Link:         hrefAbs,
 			Ext:          getExt(href),
 		}
 
@@ -315,6 +320,17 @@ func (s *Supplier) parseSubPage(html, videoFPath string, season, episode int) []
 	})
 
 	return subInfos
+}
+
+// makeAbsoluteUrl 将相对路径转换为绝对 URL
+func (s *Supplier) makeAbsoluteUrl(href, rootUrl string) string {
+	if strings.HasPrefix(href, "http") {
+		return href
+	}
+	if strings.HasPrefix(href, "/") {
+		return rootUrl + href
+	}
+	return rootUrl + "/" + href
 }
 
 func getExt(href string) string {
@@ -334,18 +350,7 @@ func getExt(href string) string {
 	return ".zip"
 }
 
-// getTotalPage 从搜索页获取总页数
-func (s *Supplier) getTotalPage(doc *goquery.Document) int {
-	var maxPage int
-	doc.Find(".pagination a, .page a").EachWithBreak(func(i int, selection *goquery.Selection) bool {
-		text := selection.Text()
-		if n, err := strconv.Atoi(strings.TrimSpace(text)); err == nil && n > maxPage {
-			maxPage = n
-		}
-		return true
-	})
-	return maxPage
-}
+// getTotalPage removed as unused
 
 // SearchResultItem 搜索结果项
 type SearchResultItem struct {
