@@ -209,8 +209,11 @@ func (s *Supplier) GetSubListFromFile4Anime(seriesInfo *series.SeriesInfo) ([]su
 // searchKeyword uses FlareSolverr to search for subtitles
 func (s *Supplier) searchKeyword(keyword string, isMovie bool) ([]SearchResultItem, error) {
 	searchUrl := settings.Get().AdvancedSettings.SuppliersSettings.SubHD.GetSearchUrl()
-	encoded := url.QueryEscape(keyword)
-	pageUrl := fmt.Sprintf("%s%s", searchUrl, encoded)
+	// SubHD search URL is /search/{keyword}/page — keyword goes in the path,
+	// so spaces must be %20, not + (which url.QueryEscape would produce).
+	// GetSearchUrl() returns "RootUrl + /search/%s" — we use it as the format.
+	encoded := url.PathEscape(keyword)
+	pageUrl := fmt.Sprintf(searchUrl, encoded)
 
 	resp, err := s.flareSolverrRequest("GET", pageUrl, nil, nil, 30000)
 	if err != nil {
@@ -235,9 +238,10 @@ func (s *Supplier) parseSearchResult(body io.Reader, isMovie bool) ([]SearchResu
 
 	searchResultItems := make([]SearchResultItem, 0)
 
-	// SubHD search results use: <a class="link-dark align-middle" href="/a/{id}">{title}
-	// Extract all /a/{id} links with their titles
-	re := regexp.MustCompile(`href="/a/([a-zA-Z0-9]+)"[^>]*>([^<]+)<`)
+	// SubHD search results: <a class="link-dark ..." href="/a/{id}">{title}</a>
+	// HTML may have either class-then-href or href-then-class; we anchor on
+	// <a ... href="/a/...">...</a> so attribute order does not matter.
+	re := regexp.MustCompile(`<a\s+[^>]*href="/a/([a-zA-Z0-9]+)"[^>]*>([^<]+)</a>`)
 	matches := re.FindAllStringSubmatch(html, -1)
 
 	for _, match := range matches {

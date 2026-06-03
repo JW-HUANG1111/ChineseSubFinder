@@ -176,6 +176,32 @@ func TestParseSearchResult_ValidHTML(t *testing.T) {
 	}
 }
 
+// TestParseSearchResult_RealSubHDLayout mirrors the actual 2026 subhd.tv HTML
+// where the <a> tag is: <a class="link-dark ..." href="/a/{id}">title</a>
+// (class attribute precedes href). The previous regex required href to come
+// first, which silently returned 0 results on the live site.
+func TestParseSearchResult_RealSubHDLayout(t *testing.T) {
+	s := newTestSupplier(t)
+	html := `<html><body>
+<a class="link-dark" href="/a/oPC5hl">Widows.Bay.S01E08.1080p.WEBRip.x265</a>
+<a class="link-dark" href="/a/MWSwen">Inception.2010.1080p.BluRay</a>
+<a class="link-dark align-middle" href="/a/pQM5Wk">Inception.2010.2160p.REMUX</a>
+</body></html>`
+	items, err := s.parseSearchResult(strings.NewReader(html), false)
+	if err != nil {
+		t.Fatalf("parseSearchResult error: %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("expected 3 items, got %d", len(items))
+	}
+	if items[0].RUrl != "/a/oPC5hl" {
+		t.Errorf("items[0].RUrl = %q", items[0].RUrl)
+	}
+	if items[0].Title != "Widows.Bay.S01E08.1080p.WEBRip.x265" {
+		t.Errorf("items[0].Title = %q", items[0].Title)
+	}
+}
+
 // --- FlareSolverr error paths ---
 
 func TestCheckAlive_FlareSolverrDown(t *testing.T) {
