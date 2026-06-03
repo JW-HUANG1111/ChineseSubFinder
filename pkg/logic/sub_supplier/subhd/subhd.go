@@ -8,11 +8,10 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
-
-	"github.com/ChineseSubFinder/ChineseSubFinder/pkg"
 
 	common2 "github.com/ChineseSubFinder/ChineseSubFinder/pkg/types/common"
 	"github.com/ChineseSubFinder/ChineseSubFinder/pkg/types/series"
@@ -45,7 +44,7 @@ func NewSupplier(fileDownloader *file_downloader.FileDownloader) *Supplier {
 	sup.httpClient = &http.Client{Timeout: 30 * time.Second}
 
 	// Allow override via env or settings
-	if envURL := pkg.GetEnv("FLARESOLVERR_URL", ""); envURL != "" {
+	if envURL := os.Getenv("FLARESOLVERR_URL"); envURL != "" {
 		FlareSolverrURL = envURL
 	}
 
@@ -61,10 +60,9 @@ func (s *Supplier) CheckAlive() (bool, int64) {
 		s.log.Errorln(s.GetSupplierName(), "CheckAlive.FlareSolverr", err)
 		return false, 0
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		s.log.Errorln(s.GetSupplierName(), "CheckAlive.StatusCode", resp.StatusCode)
+	if resp.Solution.Status != 200 {
+		s.log.Errorln(s.GetSupplierName(), "CheckAlive.StatusCode", resp.Solution.Status)
 		return false, 0
 	}
 	s.isAlive = true
@@ -113,10 +111,9 @@ func (s *Supplier) GetSubListFromFile4Movie(videoFPath string) ([]supplier.SubIn
 		return nil, err
 	}
 
-	airTime, err := time.Parse("2006", mediaInfo.Year)
-	if err != nil || mediaInfo.Year == "" {
-		searchKeyword := keyWord
-	} else {
+	airTime, _ := time.Parse("2006", mediaInfo.Year)
+	searchKeyword := keyWord
+	if err == nil && mediaInfo.Year != "" {
 		searchKeyword = fmt.Sprintf("%s %d", keyWord, airTime.Year())
 	}
 	s.log.Infoln(s.GetSupplierName(), "searchKeyword", searchKeyword)
@@ -219,13 +216,12 @@ func (s *Supplier) searchKeyword(keyword string, isMovie bool) ([]SearchResultIt
 	if err != nil {
 		return nil, errors.New("FlareSolverr request error:" + err.Error())
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("FlareSolverr status %d", resp.StatusCode)
+	if resp.Solution.Status != 200 {
+		return nil, fmt.Errorf("FlareSolverr status %d", resp.Solution.Status)
 	}
 
-	return s.parseSearchResult(resp.Body, isMovie)
+	return s.parseSearchResult(strings.NewReader(resp.Solution.Response), isMovie)
 }
 
 // parseSearchResult parses SubHD search HTML via FlareSolverr
@@ -243,8 +239,6 @@ func (s *Supplier) parseSearchResult(body io.Reader, isMovie bool) ([]SearchResu
 	// Extract all /a/{id} links with their titles
 	re := regexp.MustCompile(`href="/a/([a-zA-Z0-9]+)"[^>]*>([^<]+)<`)
 	matches := re.FindAllStringSubmatch(html, -1)
-
-	titleRe := regexp.MustCompile(`link-dark align-middle[^>]+href="/a/([a-zA-Z0-9]+)"[^>]*>([^<]+)`)
 
 	for _, match := range matches {
 		id := match[1]
@@ -283,17 +277,12 @@ func (s *Supplier) downloadSub(videoFPath, pageUrl string, season, episode int) 
 	if err != nil {
 		return nil, errors.New("FlareSolverr request error:" + err.Error())
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("detail page status %d", resp.StatusCode)
+	if resp.Solution.Status != 200 {
+		return nil, fmt.Errorf("detail page status %d", resp.Solution.Status)
 	}
 
-	content, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	html := string(content)
+	html := resp.Solution.Response
 
 	// Extract sid from page (sid="kAlURK" attribute)
 	sidRe := regexp.MustCompile(`sid="([a-zA-Z0-9]+)"`)
@@ -317,10 +306,8 @@ func (s *Supplier) downloadSub(videoFPath, pageUrl string, season, episode int) 
 	if err != nil {
 		return nil, errors.New("FlareSolverr AJAX request error:" + err.Error())
 	}
-	defer ajaxResp.Body.Close()
 
-	ajaxContent, _ := io.ReadAll(ajaxResp.Body)
-	ajaxHtml := string(ajaxContent)
+	ajaxHtml := ajaxResp.Solution.Response
 
 	// Check if we got JSON with success=true and url
 	if strings.Contains(ajaxHtml, `"success":true`) && strings.Contains(ajaxHtml, `"url"`) {
@@ -330,12 +317,11 @@ func (s *Supplier) downloadSub(videoFPath, pageUrl string, season, episode int) 
 			downloadUrl := urlMatch[1]
 			ext := getExt(downloadUrl)
 			return &supplier.SubInfo{
-				Season:       season,
-				Episode:      episode,
-				VideoFPath:   videoFPath,
-				SupplierName: s.GetSupplierName(),
-				Link:         downloadUrl,
-				Ext:          ext,
+				Season:    season,
+				Episode:   episode,
+				FromWhere: s.GetSupplierName(),
+				FileUrl:   downloadUrl,
+				Ext:       ext,
 			}, nil
 		}
 	}

@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -99,10 +98,9 @@ func (s *Supplier) GetSubListFromFile4Movie(videoFPath string) ([]supplier.SubIn
 		return nil, err
 	}
 
-	airTime, err := time.Parse("2006", mediaInfo.Year)
-	if err != nil || mediaInfo.Year == "" {
-		searchKeyword = keyWord
-	} else {
+	airTime, _ := time.Parse("2006", mediaInfo.Year)
+	searchKeyword := keyWord
+	if err == nil && mediaInfo.Year != "" {
 		searchKeyword = fmt.Sprintf("%s %d", keyWord, airTime.Year())
 	}
 	s.log.Infoln(s.GetSupplierName(), "searchKeyword", searchKeyword)
@@ -307,12 +305,11 @@ func (s *Supplier) parseSubPage(html, videoFPath string, season, episode int) []
 
 		hrefAbs := s.makeAbsoluteUrl(href, settings.Get().AdvancedSettings.SuppliersSettings.Zimuku.RootUrl)
 		subInfo := supplier.SubInfo{
-			Season:       season,
-			Episode:      episode,
-			VideoFPath:   videoFPath,
-			SupplierName: s.GetSupplierName(),
-			Link:         hrefAbs,
-			Ext:          getExt(href),
+			Season:    season,
+			Episode:   episode,
+			FromWhere: s.GetSupplierName(),
+			FileUrl:   hrefAbs,
+			Ext:       getExt(href),
 		}
 
 		subInfos = append(subInfos, subInfo)
